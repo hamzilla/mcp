@@ -275,7 +275,7 @@ async def main():
 
     client = MCPClient(
         server_configs=servers,
-        model_name="deepseek-r1:70b",  # or any other Ollama model you have
+        model_name="gpt-oss:20b",  # or any other Ollama model you have
         ollama_base_url="http://localhost:11434"
     )
 
