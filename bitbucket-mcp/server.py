@@ -203,6 +203,116 @@ class BitbucketPipelineServer:
                         "required": [] if self.settings.bitbucket_repo_slug else ["repo_slug"],
                     },
                 ),
+                Tool(
+                    name="run_pipeline",
+                    description=f"Trigger a new pipeline execution for a repository.{' Default repo: ' + self.settings.bitbucket_repo_slug if self.settings.bitbucket_repo_slug else ''}",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "workspace": {
+                                "type": "string",
+                                "description": f"Bitbucket workspace name (defaults to {self.settings.bitbucket_workspace})",
+                            },
+                            "repo_slug": {
+                                "type": "string",
+                                "description": f"Repository slug/name{' (defaults to ' + self.settings.bitbucket_repo_slug + ')' if self.settings.bitbucket_repo_slug else ''}",
+                            },
+                            "ref_type": {
+                                "type": "string",
+                                "description": "Reference type: branch, tag, bookmark, or named_branch",
+                                "enum": ["branch", "tag", "bookmark", "named_branch"],
+                            },
+                            "ref_name": {
+                                "type": "string",
+                                "description": "Name of the branch, tag, or bookmark",
+                            },
+                            "variables": {
+                                "type": "array",
+                                "description": "Optional pipeline variables as array of {key, value, secured} objects",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "key": {"type": "string"},
+                                        "value": {"type": "string"},
+                                        "secured": {"type": "boolean"},
+                                    },
+                                    "required": ["key", "value"],
+                                },
+                            },
+                        },
+                        "required": ["ref_type", "ref_name"] if self.settings.bitbucket_repo_slug else ["repo_slug", "ref_type", "ref_name"],
+                    },
+                ),
+                Tool(
+                    name="stop_pipeline",
+                    description=f"Stop a currently running pipeline.{' Default repo: ' + self.settings.bitbucket_repo_slug if self.settings.bitbucket_repo_slug else ''}",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "workspace": {
+                                "type": "string",
+                                "description": f"Bitbucket workspace name (defaults to {self.settings.bitbucket_workspace})",
+                            },
+                            "repo_slug": {
+                                "type": "string",
+                                "description": f"Repository slug/name{' (defaults to ' + self.settings.bitbucket_repo_slug + ')' if self.settings.bitbucket_repo_slug else ''}",
+                            },
+                            "pipeline_uuid": {
+                                "type": "string",
+                                "description": "Pipeline UUID to stop",
+                            },
+                        },
+                        "required": ["pipeline_uuid"] if self.settings.bitbucket_repo_slug else ["repo_slug", "pipeline_uuid"],
+                    },
+                ),
+                Tool(
+                    name="get_pipeline_steps",
+                    description=f"Get all steps for a specific pipeline.{' Default repo: ' + self.settings.bitbucket_repo_slug if self.settings.bitbucket_repo_slug else ''}",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "workspace": {
+                                "type": "string",
+                                "description": f"Bitbucket workspace name (defaults to {self.settings.bitbucket_workspace})",
+                            },
+                            "repo_slug": {
+                                "type": "string",
+                                "description": f"Repository slug/name{' (defaults to ' + self.settings.bitbucket_repo_slug + ')' if self.settings.bitbucket_repo_slug else ''}",
+                            },
+                            "pipeline_uuid": {
+                                "type": "string",
+                                "description": "Pipeline UUID",
+                            },
+                        },
+                        "required": ["pipeline_uuid"] if self.settings.bitbucket_repo_slug else ["repo_slug", "pipeline_uuid"],
+                    },
+                ),
+                Tool(
+                    name="get_pipeline_step",
+                    description=f"Get detailed information about a specific pipeline step.{' Default repo: ' + self.settings.bitbucket_repo_slug if self.settings.bitbucket_repo_slug else ''}",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "workspace": {
+                                "type": "string",
+                                "description": f"Bitbucket workspace name (defaults to {self.settings.bitbucket_workspace})",
+                            },
+                            "repo_slug": {
+                                "type": "string",
+                                "description": f"Repository slug/name{' (defaults to ' + self.settings.bitbucket_repo_slug + ')' if self.settings.bitbucket_repo_slug else ''}",
+                            },
+                            "pipeline_uuid": {
+                                "type": "string",
+                                "description": "Pipeline UUID",
+                            },
+                            "step_uuid": {
+                                "type": "string",
+                                "description": "Step UUID",
+                            },
+                        },
+                        "required": ["pipeline_uuid", "step_uuid"] if self.settings.bitbucket_repo_slug else ["repo_slug", "pipeline_uuid", "step_uuid"],
+                    },
+                ),
             ]
 
         @self.server.call_tool()
@@ -221,6 +331,14 @@ class BitbucketPipelineServer:
                     result = await self.analyze_step_failures(**arguments)
                 elif name == "get_latest_failure_logs":
                     result = await self.get_latest_failure_logs(**arguments)
+                elif name == "run_pipeline":
+                    result = await self.run_pipeline(**arguments)
+                elif name == "stop_pipeline":
+                    result = await self.stop_pipeline(**arguments)
+                elif name == "get_pipeline_steps":
+                    result = await self.get_pipeline_steps(**arguments)
+                elif name == "get_pipeline_step":
+                    result = await self.get_pipeline_step(**arguments)
                 else:
                     raise ValueError(f"Unknown tool: {name}")
 
@@ -569,6 +687,149 @@ class BitbucketPipelineServer:
                 "duration_seconds": failed_step.get("duration_seconds"),
             },
             "logs": logs["logs"],
+        }
+
+    async def run_pipeline(
+        self,
+        ref_type: str,
+        ref_name: str,
+        repo_slug: Optional[str] = None,
+        workspace: Optional[str] = None,
+        variables: Optional[list[dict[str, Any]]] = None,
+    ) -> dict[str, Any]:
+        """Trigger a new pipeline execution."""
+        ws = self._get_workspace(workspace)
+        rs = self._get_repo_slug(repo_slug)
+
+        url = f"/repositories/{ws}/{rs}/pipelines/"
+
+        # Build the request body according to Bitbucket API
+        body = {
+            "target": {
+                "ref_type": ref_type,
+                "type": "pipeline_ref_target",
+                "ref_name": ref_name,
+            }
+        }
+
+        # Add variables if provided
+        if variables:
+            body["variables"] = variables
+
+        response = await self.client.post(url, json=body)
+        response.raise_for_status()
+        pipeline = response.json()
+
+        return {
+            "workspace": ws,
+            "repository": rs,
+            "pipeline": {
+                "uuid": pipeline.get("uuid"),
+                "build_number": pipeline.get("build_number"),
+                "state": pipeline.get("state", {}).get("name"),
+                "created_on": pipeline.get("created_on"),
+                "target": pipeline.get("target"),
+            },
+            "message": f"Pipeline triggered successfully for {ref_type} {ref_name}",
+        }
+
+    async def stop_pipeline(
+        self,
+        pipeline_uuid: str,
+        repo_slug: Optional[str] = None,
+        workspace: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Stop a running pipeline."""
+        ws = self._get_workspace(workspace)
+        rs = self._get_repo_slug(repo_slug)
+        pipeline_uuid = self._normalize_uuid(pipeline_uuid)
+
+        url = f"/repositories/{ws}/{rs}/pipelines/{pipeline_uuid}/stopPipeline"
+
+        # Empty POST request to stop the pipeline
+        response = await self.client.post(url, json={})
+        response.raise_for_status()
+
+        return {
+            "workspace": ws,
+            "repository": rs,
+            "pipeline_uuid": pipeline_uuid,
+            "message": "Pipeline stop signal sent successfully",
+        }
+
+    async def get_pipeline_steps(
+        self,
+        pipeline_uuid: str,
+        repo_slug: Optional[str] = None,
+        workspace: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Get all steps for a specific pipeline."""
+        ws = self._get_workspace(workspace)
+        rs = self._get_repo_slug(repo_slug)
+        pipeline_uuid = self._normalize_uuid(pipeline_uuid)
+
+        url = f"/repositories/{ws}/{rs}/pipelines/{pipeline_uuid}/steps/"
+
+        response = await self.client.get(url)
+        response.raise_for_status()
+        data = response.json()
+
+        steps = []
+        for step in data.get("values", []):
+            state = step.get("state", {})
+            steps.append({
+                "uuid": step.get("uuid"),
+                "name": step.get("name"),
+                "state": state.get("name"),
+                "result": state.get("result", {}).get("name") if state.get("result") else None,
+                "started_on": step.get("started_on"),
+                "completed_on": step.get("completed_on"),
+                "duration_seconds": step.get("duration_in_seconds"),
+            })
+
+        return {
+            "workspace": ws,
+            "repository": rs,
+            "pipeline_uuid": pipeline_uuid,
+            "total_steps": len(steps),
+            "steps": steps,
+        }
+
+    async def get_pipeline_step(
+        self,
+        pipeline_uuid: str,
+        step_uuid: str,
+        repo_slug: Optional[str] = None,
+        workspace: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Get detailed information about a specific pipeline step."""
+        ws = self._get_workspace(workspace)
+        rs = self._get_repo_slug(repo_slug)
+        pipeline_uuid = self._normalize_uuid(pipeline_uuid)
+        step_uuid = self._normalize_uuid(step_uuid)
+
+        url = f"/repositories/{ws}/{rs}/pipelines/{pipeline_uuid}/steps/{step_uuid}"
+
+        response = await self.client.get(url)
+        response.raise_for_status()
+        step = response.json()
+
+        state = step.get("state", {})
+        return {
+            "workspace": ws,
+            "repository": rs,
+            "pipeline_uuid": pipeline_uuid,
+            "step": {
+                "uuid": step.get("uuid"),
+                "name": step.get("name"),
+                "state": state.get("name"),
+                "result": state.get("result", {}).get("name") if state.get("result") else None,
+                "started_on": step.get("started_on"),
+                "completed_on": step.get("completed_on"),
+                "duration_seconds": step.get("duration_in_seconds"),
+                "setup_commands": step.get("setup_commands"),
+                "script_commands": step.get("script_commands"),
+            },
         }
 
     async def run(self):
