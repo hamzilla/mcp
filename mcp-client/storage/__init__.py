@@ -2,10 +2,7 @@
 Storage module for MCP Client.
 
 Uses LangGraph's AsyncPostgresSaver for conversation state persistence.
-Also provides custom tables for agent mode (scheduled tasks, alerts, webhooks).
 """
-
-from .conversation_store import ConversationStore  # Keep for agent mode methods only
 
 
 def build_connection_string(
@@ -31,4 +28,4 @@ def build_connection_string(
     return f"postgresql://{user}:{password}@{host}:{port}/{database}"
 
 
-__all__ = ["build_connection_string", "ConversationStore"]
+__all__ = ["build_connection_string"]
