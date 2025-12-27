@@ -1,7 +1,7 @@
 [project]
 name = "mcp-client"
 version = "0.1.0"
-description = "Add your description here"
+description = "Production-ready MCP client with conversation memory, model switching, and observability"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
@@ -11,4 +11,12 @@ dependencies = [
     "loguru>=0.7.3",
     "mcp-use>=1.2.8",
     "mcp[cli]>=1.7.1",
+    # Configuration management
+    "pydantic>=2.10.5",
+    "pydantic-settings>=2.7.1",
+    "python-dotenv>=1.0.0",
+    # Database (optional)
+    "asyncpg>=0.30.0",
+    # Metrics
+    "prometheus-client>=0.21.1",
 ]

@@ -1,9 +1,18 @@
 """
-Basic MCP client that connects to multiple MCP servers using Ollama.
+Production-ready MCP client that connects to multiple MCP servers using Ollama.
+
+Features:
+- Configurable via environment variables
+- Structured logging with correlation IDs
+- Proper iteration limit handling with partial results
+- Robust error handling
 """
 
 import asyncio
+import uuid
+import os
 from contextlib import AsyncExitStack
+from typing import Optional
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
@@ -12,97 +21,124 @@ from langchain_ollama import ChatOllama
 from langchain_core.messages import HumanMessage, ToolMessage
 from loguru import logger
 
+from config import MCPClientConfig, ServerConfig
+from logging_config import setup_logging
+
 
 class MCPClient:
     """MCP Client that connects to multiple servers and uses Ollama for LLM interactions."""
 
-    def __init__(
-        self,
-        server_configs: list[dict[str, str]],
-        model_name: str = "llama3.2",
-        ollama_base_url: str = "http://localhost:11434"
-    ):
+    def __init__(self, config: Optional[MCPClientConfig] = None):
         """
-        Initialize the MCP client.
+        Initialize the MCP client with configuration.
 
         Args:
-            server_configs: List of server configurations, each with 'name', 'path', and optional 'command'
-                Example: [
-                    {"name": "weather", "path": "/path/to/weather.py"},
-                    {"name": "bitbucket", "path": "/path/to/bitbucket/main.py", "command": "python"}
-                ]
-            model_name: Ollama model name to use
-            ollama_base_url: Base URL for Ollama API
+            config: MCPClientConfig instance. If None, loads from environment/.env file.
         """
-        self.server_configs = server_configs
-        self.model_name = model_name
-        self.ollama_base_url = ollama_base_url
+        # Load configuration
+        if config is None:
+            config = MCPClientConfig()
+        self.config = config
 
+        # Setup logging based on configuration
+        setup_logging(log_level=self.config.log_level, structured=False)
+
+        # Client state
         self.sessions: dict[str, ClientSession] = {}
         self.exit_stack = AsyncExitStack()
         self.llm = None
         self.tools = []
         self.tool_to_server_map = {}  # Maps tool names to server names
 
+        logger.info(
+            "MCPClient initialized",
+            model=self.config.llm.model_name,
+            max_iterations=self.config.llm.max_iterations,
+            server_count=len(self.config.servers),
+        )
+
     async def connect_to_servers(self):
         """Connect to all configured MCP servers."""
-        import os
+        logger.info(f"Connecting to {len(self.config.servers)} MCP server(s)")
 
-        logger.info(f"Connecting to {len(self.server_configs)} MCP server(s)")
+        for server_config in self.config.servers:
+            server_name = server_config.name
+            server_path = server_config.path
+            command = server_config.command
+            args = server_config.args
 
-        for server_config in self.server_configs:
-            server_name = server_config["name"]
-            server_path = server_config["path"]
-            command = server_config.get("command", "python")
-            extra_args = server_config.get("args", [])
-
-            logger.info(f"Connecting to {server_name} server: {server_path}")
-
-            # Configure server parameters for stdio connection
-            # Build args: extra_args + [server_path]
-            all_args = extra_args + [server_path]
-
-            # Determine working directory (directory containing the script)
-            # This ensures .env files are loaded correctly
-            working_dir = os.path.dirname(os.path.abspath(server_path))
-
-            server_params = StdioServerParameters(
-                command=command,
-                args=all_args,
-                env=None,
-                cwd=working_dir
+            correlation_id = str(uuid.uuid4())
+            log = logger.bind(
+                correlation_id=correlation_id,
+                server_name=server_name,
+                server_path=server_path,
             )
 
-            # Connect to server
-            stdio_transport = await self.exit_stack.enter_async_context(
-                stdio_client(server_params)
-            )
-            stdio, write = stdio_transport
-            session = await self.exit_stack.enter_async_context(
-                ClientSession(stdio, write)
-            )
+            log.info(f"Connecting to {server_name} server")
 
-            # Initialize the session
-            await session.initialize()
-            self.sessions[server_name] = session
-            logger.info(f"Connected to {server_name} server successfully")
+            try:
+                # Build command args
+                all_args = args + [server_path]
 
-            # List available tools from this server
-            response = await session.list_tools()
-            server_tools = response.tools
+                # Determine working directory (directory containing the script)
+                # This ensures .env files are loaded correctly
+                working_dir = os.path.dirname(os.path.abspath(server_path))
 
-            # Track which server each tool belongs to
-            for tool in server_tools:
-                self.tool_to_server_map[tool.name] = server_name
-                self.tools.append(tool)
+                server_params = StdioServerParameters(
+                    command=command,
+                    args=all_args,
+                    env=None,
+                    cwd=working_dir
+                )
 
-            logger.info(f"{server_name} tools: {[tool.name for tool in server_tools]}")
+                # Connect to server
+                stdio_transport = await self.exit_stack.enter_async_context(
+                    stdio_client(server_params)
+                )
+                stdio, write = stdio_transport
+                session = await self.exit_stack.enter_async_context(
+                    ClientSession(stdio, write)
+                )
 
-        logger.info(f"Total tools available: {len(self.tools)}")
+                # Initialize the session
+                await session.initialize()
+                self.sessions[server_name] = session
+                log.info(f"Connected to {server_name} server successfully")
+
+                # List available tools from this server
+                response = await session.list_tools()
+                server_tools = response.tools
+
+                # Track which server each tool belongs to
+                for tool in server_tools:
+                    self.tool_to_server_map[tool.name] = server_name
+                    self.tools.append(tool)
+
+                log.info(
+                    f"Loaded tools from {server_name}",
+                    tool_count=len(server_tools),
+                    tools=[tool.name for tool in server_tools],
+                )
+
+            except Exception as e:
+                log.error(f"Failed to connect to {server_name} server: {e}", exc_info=True)
+                raise
+
+        logger.info(
+            "All servers connected",
+            total_tools=len(self.tools),
+            servers=list(self.sessions.keys()),
+        )
 
     async def initialize_llm(self):
         """Initialize Ollama LLM with MCP tools."""
-        logger.info(f"Initializing Ollama with model: {self.model_name}")
+        correlation_id = str(uuid.uuid4())
+        log = logger.bind(
+            correlation_id=correlation_id,
+            model=self.config.llm.model_name,
+        )
+
+        log.info(f"Initializing Ollama LLM with model {self.config.llm.model_name}")
 
         # Convert MCP tools to LangChain format
         langchain_tools = []
@@ -118,56 +154,83 @@ class MCPClient:
 
         # Initialize ChatOllama with tools
         self.llm = ChatOllama(
-            model=self.model_name,
-            base_url=self.ollama_base_url,
-            temperature=0
+            model=self.config.llm.model_name,
+            base_url=self.config.ollama_base_url,
+            temperature=self.config.llm.temperature
         ).bind_tools(langchain_tools)
 
-        logger.info("LLM initialized with tools")
+        log.info(
+            "LLM initialized with tools",
+            tool_count=len(langchain_tools),
+            temperature=self.config.llm.temperature,
+        )
 
-    async def process_query(self, query: str) -> str:
+    async def process_query(self, query: str, correlation_id: Optional[str] = None) -> dict:
         """
         Process a user query using the LLM and MCP tools.
 
         Args:
             query: User's question or request
+            correlation_id: Optional correlation ID for tracking. Auto-generated if not provided.
 
         Returns:
-            The final response from the LLM
+            Dictionary with:
+                - content: The final response from the LLM
+                - iterations: Number of iterations used
+                - status: 'success' or 'max_iterations_reached'
+                - partial: True if hit max iterations
         """
-        logger.info(f"Processing query: {query}")
+        if correlation_id is None:
+            correlation_id = str(uuid.uuid4())
+
+        log = logger.bind(correlation_id=correlation_id)
+        log.info("Processing query", query=query)
 
         messages = [HumanMessage(content=query)]
 
         # Run the agent loop
-        max_iterations = 10
+        max_iterations = self.config.llm.max_iterations
         for i in range(max_iterations):
-            logger.debug(f"Iteration {i + 1}/{max_iterations}")
-
-            # Check if we're at the last iteration before calling LLM
-            if i == max_iterations - 1:
-                logger.warning("Reached maximum iterations, stopping")
-                return "Sorry, I couldn't complete the task within the iteration limit. The conversation was too complex or the model kept trying to call tools."
+            log.debug(f"Agent loop iteration {i + 1}/{max_iterations}")
 
             try:
                 # Get response from LLM with timeout
+                timeout = self.config.llm.timeout_seconds
                 response = await asyncio.wait_for(
                     self.llm.ainvoke(messages),
-                    timeout=60.0  # 60 second timeout
+                    timeout=float(timeout)
                 )
                 messages.append(response)
+
+                log.debug("LLM response received", has_tool_calls=bool(response.tool_calls))
+
             except asyncio.TimeoutError:
-                logger.error("LLM call timed out")
-                return "Sorry, the request timed out. Please try again with a simpler question."
+                log.error(f"LLM call timed out after {timeout}s")
+                return {
+                    "content": f"Sorry, the request timed out after {timeout} seconds. Please try again with a simpler question.",
+                    "iterations": i + 1,
+                    "status": "timeout",
+                    "partial": True,
+                }
             except Exception as e:
-                logger.error(f"Error calling LLM: {e}")
-                return f"Error communicating with the AI model: {str(e)}"
+                log.error(f"Error calling LLM: {e}", exc_info=True)
+                return {
+                    "content": f"Error communicating with the AI model: {str(e)}",
+                    "iterations": i + 1,
+                    "status": "error",
+                    "partial": True,
+                }
 
             # Check if LLM wants to call a tool
             if not response.tool_calls:
                 # No more tool calls, return the final response
-                logger.info("No more tool calls, returning response")
-                return response.content
+                log.info("Query completed successfully", iterations=i + 1)
+                return {
+                    "content": response.content,
+                    "iterations": i + 1,
+                    "status": "success",
+                    "partial": False,
+                }
 
             # Process each tool call
             for tool_call in response.tool_calls:
@@ -175,7 +238,11 @@ class MCPClient:
                 tool_args = tool_call["args"]
                 tool_call_id = tool_call["id"]
 
-                logger.info(f"Calling tool: {tool_name} with args: {tool_args}")
+                tool_log = log.bind(
+                    tool_name=tool_name,
+                    tool_call_id=tool_call_id,
+                )
+                tool_log.info(f"Calling tool {tool_name}", args=tool_args)
 
                 try:
                     # Find which server has this tool
@@ -184,15 +251,15 @@ class MCPClient:
                         raise ValueError(f"Tool {tool_name} not found in any connected server")
 
                     session = self.sessions[server_name]
-                    logger.debug(f"Routing {tool_name} to {server_name} server")
+                    tool_log.debug(f"Routing tool to server", server=server_name)
 
                     # Call the MCP tool on the appropriate server
                     result = await session.call_tool(tool_name, arguments=tool_args)
                     tool_result = result.content[0].text if result.content else "No result"
-                    logger.debug(f"Tool result: {tool_result}")
+                    tool_log.info("Tool call completed successfully")
 
                 except Exception as e:
-                    logger.error(f"Error calling tool {tool_name}: {e}")
+                    tool_log.error(f"Error calling tool: {e}", exc_info=True)
                     tool_result = f"Error: {str(e)}"
 
                 # Add tool result to messages
@@ -203,17 +270,38 @@ class MCPClient:
                     )
                 )
 
-        logger.warning("Reached maximum iterations (shouldn't get here)")
-        return "Sorry, I couldn't complete the task within the iteration limit."
+        # If we exit the loop, we hit max iterations
+        log.warning(
+            f"Reached max iterations ({max_iterations}), returning partial result",
+            iterations=max_iterations,
+        )
+
+        # Return partial result with the last response
+        final_content = response.content if response and response.content else \
+                       "I couldn't complete the task within the iteration limit. The conversation required too many tool calls."
+
+        return {
+            "content": final_content,
+            "iterations": max_iterations,
+            "status": "max_iterations_reached",
+            "partial": True,
+        }
 
     async def chat_loop(self):
         """Run an interactive chat loop."""
-        logger.info("Starting chat loop. Type 'quit' or 'exit' to stop.")
+        session_id = str(uuid.uuid4())
+        log = logger.bind(session_id=session_id)
+
+        log.info("Starting chat loop")
         print("\n🤖 Multi-Server MCP Client with Ollama")
         print("=" * 50)
         print(f"Connected servers: {', '.join(self.sessions.keys())}")
         print(f"Total tools available: {len(self.tools)}")
+        print(f"Model: {self.config.llm.model_name}")
+        print(f"Max iterations: {self.config.llm.max_iterations}")
         print("Ask me anything!\n")
+
+        query_count = 0
 
         while True:
             try:
@@ -226,21 +314,31 @@ class MCPClient:
                 if not user_input:
                     continue
 
+                query_count += 1
+                correlation_id = f"{session_id}-q{query_count}"
+
                 # Process the query
-                response = await self.process_query(user_input)
-                print(f"\nAssistant: {response}\n")
+                result = await self.process_query(user_input, correlation_id=correlation_id)
+
+                # Display result
+                print(f"\nAssistant: {result['content']}\n")
+
+                # Show metadata if partial result
+                if result.get("partial"):
+                    print(f"(⚠️  Partial result after {result['iterations']} iterations - {result['status']})\n")
 
             except KeyboardInterrupt:
                 print("\n\nGoodbye!")
                 break
             except Exception as e:
-                logger.error(f"Error in chat loop: {e}")
+                log.error(f"Error in chat loop: {e}", exc_info=True)
                 print(f"\nError: {str(e)}\n")
 
     async def cleanup(self):
         """Clean up resources."""
-        logger.info("Cleaning up...")
+        logger.info("Cleaning up resources")
         await self.exit_stack.aclose()
+        logger.info("Cleanup complete")
 
     async def run(self):
         """Main entry point to run the client."""
@@ -254,31 +352,30 @@ class MCPClient:
 
 async def main():
     """Main function to run the MCP client."""
-    # Configure multiple MCP servers
+    # Example of configuring servers programmatically
+    # Note: In production, you might want to load these from a config file
+    from config import ServerConfig
+
     servers = [
-        {
-            "name": "weather",
-            "path": "/Users/hamzilla/mcp/weather/weather.py",
-            "command": "uv",
-            "args": ["run"]
-        },
-        {
-            "name": "bitbucket",
-            "path": "/Users/hamzilla/mcp/bitbucket-mcp/main.py",
-            "command": "uv",
-            "args": ["run"]
-        }
+        ServerConfig(
+            name="weather",
+            path="/Users/hamzilla/mcp/weather/weather.py",
+            command="uv",
+            args=["run"]
+        ),
+        ServerConfig(
+            name="bitbucket",
+            path="/Users/hamzilla/mcp/bitbucket-mcp/main.py",
+            command="uv",
+            args=["run"]
+        )
     ]
 
-    # You can also use different commands like "uvx" or "npx" for different server types
-    # For example: {"name": "npm-server", "path": "mcp-server-weather", "command": "npx"}
+    # Create configuration
+    config = MCPClientConfig(servers=servers)
 
-    client = MCPClient(
-        server_configs=servers,
-        model_name="gpt-oss:20b",  # or any other Ollama model you have
-        ollama_base_url="http://localhost:11434"
-    )
-
+    # Create and run client
+    client = MCPClient(config=config)
     await client.run()
 
 
