@@ -25,7 +25,6 @@ from loguru import logger
 
 from config import MCPClientConfig, ServerConfig
 from logging_config import setup_logging
-from storage import build_connection_string
 from mcp_tool_wrapper import create_mcp_tool
 
 
@@ -82,14 +81,8 @@ class MCPClient:
             database=self.config.database.database,
         )
 
-        # Build PostgreSQL connection string for LangChain
-        self.connection_string = build_connection_string(
-            host=self.config.database.host,
-            port=self.config.database.port,
-            database=self.config.database.database,
-            user=self.config.database.user,
-            password=self.config.database.password,
-        )
+        # Get PostgreSQL connection string from config
+        self.connection_string = self.config.database.connection_string
 
         # Initialize LangGraph PostgreSQL checkpointer for conversation state persistence
         try:

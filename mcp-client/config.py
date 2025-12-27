@@ -73,6 +73,16 @@ class DatabaseConfig(BaseModel):
     pool_min_size: int = 2
     pool_max_size: int = 10
 
+    @property
+    def connection_string(self) -> str:
+        """
+        Build PostgreSQL connection string.
+
+        Returns:
+            Connection string in format: postgresql://user:password@host:port/database
+        """
+        return f"postgresql://{self.user}:{self.password}@{self.host}:{self.port}/{self.database}"
+
     @field_validator("port")
     @classmethod
     def validate_port(cls, v: int) -> int:
