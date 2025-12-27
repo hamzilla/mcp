@@ -18,11 +18,15 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
 from langchain_ollama import ChatOllama
-from langchain_core.messages import HumanMessage, ToolMessage
+from langchain_core.messages import HumanMessage
+from langchain.agents import create_agent
+from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from loguru import logger
 
 from config import MCPClientConfig, ServerConfig
 from logging_config import setup_logging
+from storage import build_connection_string
+from mcp_tool_wrapper import create_mcp_tool
 
 
 class MCPClient:
@@ -47,15 +51,71 @@ class MCPClient:
         self.sessions: dict[str, ClientSession] = {}
         self.exit_stack = AsyncExitStack()
         self.llm = None
-        self.tools = []
-        self.tool_to_server_map = {}  # Maps tool names to server names
+        self.langchain_tools = []  # LangChain StructuredTool objects
+        self.agent = None  # LangGraph agent
+        self.checkpointer = None  # PostgreSQL checkpointer for conversation state
+        self._checkpointer_cm = None  # Context manager for checkpointer cleanup
+
+        # Database connection string (optional)
+        self.connection_string: Optional[str] = None
 
         logger.info(
             "MCPClient initialized",
             model=self.config.llm.model_name,
             max_iterations=self.config.llm.max_iterations,
             server_count=len(self.config.servers),
+            database_enabled=self.config.database is not None,
         )
+
+    async def initialize_database(self):
+        """Initialize database connection string and checkpointer if configured."""
+        if not self.config.database:
+            logger.info("\033[31mDatabase not configured, skipping initialization\033[0m")
+            return
+
+        correlation_id = str(uuid.uuid4())
+        log = logger.bind(correlation_id=correlation_id)
+
+        log.info(
+            "Building database connection string",
+            host=self.config.database.host,
+            database=self.config.database.database,
+        )
+
+        # Build PostgreSQL connection string for LangChain
+        self.connection_string = build_connection_string(
+            host=self.config.database.host,
+            port=self.config.database.port,
+            database=self.config.database.database,
+            user=self.config.database.user,
+            password=self.config.database.password,
+        )
+
+        # Initialize LangGraph PostgreSQL checkpointer for conversation state persistence
+        try:
+            log.info("Attempting to connect to PostgreSQL...")
+            # AsyncPostgresSaver.from_conn_string() returns an async context manager
+            # We need to enter it to get the actual saver
+            checkpointer_cm = AsyncPostgresSaver.from_conn_string(
+                self.connection_string
+            )
+            self.checkpointer = await checkpointer_cm.__aenter__()
+            # Store the context manager so we can clean it up later
+            self._checkpointer_cm = checkpointer_cm
+
+            await self.checkpointer.setup()
+            log.info("✅ LangGraph PostgreSQL checkpointer initialized successfully")
+            log.info("✅ Conversations will persist across restarts")
+        except Exception as e:
+            log.error(f"❌ Failed to initialize PostgreSQL checkpointer: {e}")
+            log.error(f"   Connection string: postgresql://{self.config.database.user}:***@{self.config.database.host}:{self.config.database.port}/{self.config.database.database}")
+            log.warning("⚠️  Continuing without conversation persistence")
+            log.warning("   To enable persistence:")
+            log.warning("   1. Start PostgreSQL: docker-compose up -d")
+            log.warning("   2. Or install locally: brew install postgresql@16")
+            log.warning("   3. See SETUP_POSTGRES.md for details")
+            self.checkpointer = None
+            self._checkpointer_cm = None
 
     async def connect_to_servers(self):
         """Connect to all configured MCP servers."""
@@ -105,14 +165,20 @@ class MCPClient:
                 self.sessions[server_name] = session
                 log.info(f"Connected to {server_name} server successfully")
 
-                # List available tools from this server
+                # List available tools from this server and convert to LangChain tools
                 response = await session.list_tools()
                 server_tools = response.tools
 
-                # Track which server each tool belongs to
+                # Create LangChain StructuredTool for each MCP tool
                 for tool in server_tools:
-                    self.tool_to_server_map[tool.name] = server_name
-                    self.tools.append(tool)
+                    langchain_tool = create_mcp_tool(
+                        tool_name=tool.name,
+                        tool_description=tool.description,
+                        tool_schema=tool.inputSchema,
+                        session=session,
+                        server_name=server_name
+                    )
+                    self.langchain_tools.append(langchain_tool)
 
                 log.info(
                     f"Loaded tools from {server_name}",
@@ -126,12 +192,12 @@ class MCPClient:
 
         logger.info(
             "All servers connected",
-            total_tools=len(self.tools),
+            total_tools=len(self.langchain_tools),
             servers=list(self.sessions.keys()),
         )
 
     async def initialize_llm(self):
-        """Initialize Ollama LLM with MCP tools."""
+        """Initialize Ollama LLM and create LangGraph agent."""
         correlation_id = str(uuid.uuid4())
         log = logger.bind(
             correlation_id=correlation_id,
@@ -140,152 +206,122 @@ class MCPClient:
 
         log.info(f"Initializing Ollama LLM with model {self.config.llm.model_name}")
 
-        # Convert MCP tools to LangChain format
-        langchain_tools = []
-        for tool in self.tools:
-            langchain_tools.append({
-                "type": "function",
-                "function": {
-                    "name": tool.name,
-                    "description": tool.description or "",
-                    "parameters": tool.inputSchema
-                }
-            })
-
-        # Initialize ChatOllama with tools
+        # Initialize ChatOllama
         self.llm = ChatOllama(
             model=self.config.llm.model_name,
             base_url=self.config.ollama_base_url,
             temperature=self.config.llm.temperature
-        ).bind_tools(langchain_tools)
-
-        log.info(
-            "LLM initialized with tools",
-            tool_count=len(langchain_tools),
-            temperature=self.config.llm.temperature,
         )
 
-    async def process_query(self, query: str, correlation_id: Optional[str] = None) -> dict:
+        # Create LangGraph agent with tools and checkpointer
+        self.agent = create_agent(
+            self.llm,
+            tools=self.langchain_tools,
+            checkpointer=self.checkpointer,
+            system_prompt=f"You are a helpful DevOps assistant with access to multiple tools. "
+                         f"Use the available tools to help answer questions and perform tasks. "
+                         f"You can call multiple tools if needed to complete a task."
+        )
+
+        log.info(
+            "LangGraph agent initialized",
+            tool_count=len(self.langchain_tools),
+            temperature=self.config.llm.temperature,
+            checkpointer_enabled=self.checkpointer is not None,
+        )
+
+    async def process_query(
+        self,
+        query: str,
+        correlation_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+        use_history: bool = True
+    ) -> dict:
         """
-        Process a user query using the LLM and MCP tools.
+        Process a user query using LangGraph agent.
 
         Args:
             query: User's question or request
             correlation_id: Optional correlation ID for tracking. Auto-generated if not provided.
+            session_id: Optional session ID for conversation history. Auto-generated if not provided.
+            use_history: Whether to use conversation history (requires checkpointer)
 
         Returns:
             Dictionary with:
-                - content: The final response from the LLM
-                - iterations: Number of iterations used
-                - status: 'success' or 'max_iterations_reached'
-                - partial: True if hit max iterations
+                - content: The final response from the agent
+                - status: 'success' or 'error'
+                - session_id: Session ID (if checkpointer enabled)
         """
         if correlation_id is None:
             correlation_id = str(uuid.uuid4())
 
         log = logger.bind(correlation_id=correlation_id)
-        log.info("Processing query", query=query)
+        log.info("Processing query with LangGraph agent", query=query)
 
-        messages = [HumanMessage(content=query)]
+        # Generate session_id if not provided and checkpointer is enabled
+        if use_history and self.checkpointer:
+            if session_id is None:
+                session_id = str(uuid.uuid4())
+                log.info("Created new session", session_id=session_id)
+            else:
+                log.info("Using existing session", session_id=session_id)
+        else:
+            session_id = None
+            log.debug("Running without conversation history")
 
-        # Run the agent loop
-        max_iterations = self.config.llm.max_iterations
-        for i in range(max_iterations):
-            log.debug(f"Agent loop iteration {i + 1}/{max_iterations}")
+        try:
+            # Configure agent with recursion limit (equivalent to max_iterations)
+            config = {
+                "recursion_limit": self.config.llm.max_iterations,
+            }
 
-            try:
-                # Get response from LLM with timeout
-                timeout = self.config.llm.timeout_seconds
-                response = await asyncio.wait_for(
-                    self.llm.ainvoke(messages),
-                    timeout=float(timeout)
-                )
-                messages.append(response)
+            # Add thread_id for checkpointer (conversation persistence)
+            if session_id and self.checkpointer:
+                config["configurable"] = {"thread_id": session_id}
 
-                log.debug("LLM response received", has_tool_calls=bool(response.tool_calls))
+            # Invoke the LangGraph agent
+            log.debug("Invoking LangGraph agent", config=config)
 
-            except asyncio.TimeoutError:
-                log.error(f"LLM call timed out after {timeout}s")
-                return {
-                    "content": f"Sorry, the request timed out after {timeout} seconds. Please try again with a simpler question.",
-                    "iterations": i + 1,
-                    "status": "timeout",
-                    "partial": True,
-                }
-            except Exception as e:
-                log.error(f"Error calling LLM: {e}", exc_info=True)
-                return {
-                    "content": f"Error communicating with the AI model: {str(e)}",
-                    "iterations": i + 1,
-                    "status": "error",
-                    "partial": True,
-                }
+            result = await asyncio.wait_for(
+                self.agent.ainvoke(
+                    {"messages": [HumanMessage(content=query)]},
+                    config=config
+                ),
+                timeout=float(self.config.llm.timeout_seconds)
+            )
 
-            # Check if LLM wants to call a tool
-            if not response.tool_calls:
-                # No more tool calls, return the final response
-                log.info("Query completed successfully", iterations=i + 1)
-                return {
-                    "content": response.content,
-                    "iterations": i + 1,
-                    "status": "success",
-                    "partial": False,
-                }
+            # Extract the final response
+            messages = result.get("messages", [])
+            if messages:
+                final_message = messages[-1]
+                content = final_message.content if hasattr(final_message, "content") else str(final_message)
+            else:
+                content = "No response generated"
 
-            # Process each tool call
-            for tool_call in response.tool_calls:
-                tool_name = tool_call["name"]
-                tool_args = tool_call["args"]
-                tool_call_id = tool_call["id"]
+            log.info("Query completed successfully via LangGraph agent")
 
-                tool_log = log.bind(
-                    tool_name=tool_name,
-                    tool_call_id=tool_call_id,
-                )
-                tool_log.info(f"Calling tool {tool_name}", args=tool_args)
+            response = {
+                "content": content,
+                "status": "success",
+            }
+            if session_id:
+                response["session_id"] = session_id
 
-                try:
-                    # Find which server has this tool
-                    server_name = self.tool_to_server_map.get(tool_name)
-                    if not server_name:
-                        raise ValueError(f"Tool {tool_name} not found in any connected server")
+            return response
 
-                    session = self.sessions[server_name]
-                    tool_log.debug(f"Routing tool to server", server=server_name)
-
-                    # Call the MCP tool on the appropriate server
-                    result = await session.call_tool(tool_name, arguments=tool_args)
-                    tool_result = result.content[0].text if result.content else "No result"
-                    tool_log.info("Tool call completed successfully")
-
-                except Exception as e:
-                    tool_log.error(f"Error calling tool: {e}", exc_info=True)
-                    tool_result = f"Error: {str(e)}"
-
-                # Add tool result to messages
-                messages.append(
-                    ToolMessage(
-                        content=tool_result,
-                        tool_call_id=tool_call_id
-                    )
-                )
-
-        # If we exit the loop, we hit max iterations
-        log.warning(
-            f"Reached max iterations ({max_iterations}), returning partial result",
-            iterations=max_iterations,
-        )
-
-        # Return partial result with the last response
-        final_content = response.content if response and response.content else \
-                       "I couldn't complete the task within the iteration limit. The conversation required too many tool calls."
-
-        return {
-            "content": final_content,
-            "iterations": max_iterations,
-            "status": "max_iterations_reached",
-            "partial": True,
-        }
+        except asyncio.TimeoutError:
+            timeout = self.config.llm.timeout_seconds
+            log.error(f"Agent execution timed out after {timeout}s")
+            return {
+                "content": f"Sorry, the request timed out after {timeout} seconds. Please try again with a simpler question.",
+                "status": "timeout",
+            }
+        except Exception as e:
+            log.error(f"Error executing agent: {e}", exc_info=True)
+            return {
+                "content": f"Error executing agent: {str(e)}",
+                "status": "error",
+            }
 
     async def chat_loop(self):
         """Run an interactive chat loop."""
@@ -293,12 +329,15 @@ class MCPClient:
         log = logger.bind(session_id=session_id)
 
         log.info("Starting chat loop")
-        print("\n🤖 Multi-Server MCP Client with Ollama")
+        print("\n🤖 Multi-Server MCP Client with Ollama + LangGraph")
         print("=" * 50)
         print(f"Connected servers: {', '.join(self.sessions.keys())}")
-        print(f"Total tools available: {len(self.tools)}")
+        print(f"Total tools available: {len(self.langchain_tools)}")
         print(f"Model: {self.config.llm.model_name}")
-        print(f"Max iterations: {self.config.llm.max_iterations}")
+        print(f"Recursion limit: {self.config.llm.max_iterations}")
+        if self.checkpointer:
+            print(f"💾 Conversation persistence: Enabled (PostgreSQL)")
+            print(f"   Thread ID: {session_id}")
         print("Ask me anything!\n")
 
         query_count = 0
@@ -317,15 +356,19 @@ class MCPClient:
                 query_count += 1
                 correlation_id = f"{session_id}-q{query_count}"
 
-                # Process the query
-                result = await self.process_query(user_input, correlation_id=correlation_id)
+                # Process the query (pass session_id to maintain conversation history)
+                result = await self.process_query(
+                    user_input,
+                    correlation_id=correlation_id,
+                    session_id=session_id  # Same session ID for entire chat session
+                )
 
                 # Display result
                 print(f"\nAssistant: {result['content']}\n")
 
-                # Show metadata if partial result
-                if result.get("partial"):
-                    print(f"(⚠️  Partial result after {result['iterations']} iterations - {result['status']})\n")
+                # Show status if not success
+                if result.get("status") != "success":
+                    print(f"(⚠️  Status: {result['status']})\n")
 
             except KeyboardInterrupt:
                 print("\n\nGoodbye!")
@@ -337,14 +380,33 @@ class MCPClient:
     async def cleanup(self):
         """Clean up resources."""
         logger.info("Cleaning up resources")
+
+        # Close server connections
         await self.exit_stack.aclose()
+
+        # Close PostgreSQL checkpointer connection if it exists
+        if self._checkpointer_cm:
+            try:
+                await self._checkpointer_cm.__aexit__(None, None, None)
+                logger.info("PostgreSQL checkpointer closed")
+            except Exception as e:
+                logger.warning(f"Error closing checkpointer: {e}")
+
         logger.info("Cleanup complete")
 
     async def run(self):
         """Main entry point to run the client."""
         try:
+            # Initialize database first (if configured)
+            await self.initialize_database()
+
+            # Connect to MCP servers
             await self.connect_to_servers()
+
+            # Initialize LLM
             await self.initialize_llm()
+
+            # Start chat loop
             await self.chat_loop()
         finally:
             await self.cleanup()
@@ -352,6 +414,10 @@ class MCPClient:
 
 async def main():
     """Main function to run the MCP client."""
+    # Load environment variables from .env file
+    from dotenv import load_dotenv
+    load_dotenv()
+
     # Example of configuring servers programmatically
     # Note: In production, you might want to load these from a config file
     from config import ServerConfig

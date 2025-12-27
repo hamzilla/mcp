@@ -15,8 +15,13 @@ dependencies = [
     "pydantic>=2.10.5",
     "pydantic-settings>=2.7.1",
     "python-dotenv>=1.0.0",
-    # Database (optional)
+    # LangChain/LangGraph for agent and conversation memory
+    "langgraph>=0.2.59",
+    "langchain-core>=0.3.29",
+    "langchain-postgres>=0.0.12",
+    # Database (for agent mode tables: scheduled_tasks, alerts, webhooks)
     "asyncpg>=0.30.0",
     # Metrics
     "prometheus-client>=0.21.1",
+    "langgraph-checkpoint-postgres>=3.0.2",
 ]
