@@ -97,7 +97,11 @@ def create_mcp_tool(
         tool_log.debug(f"Executing MCP tool", args=kwargs)
 
         try:
-            result = await session.call_tool(tool_name, arguments=kwargs)
+            # Filter out None values for optional parameters
+            # MCP servers validate against JSON schema which doesn't accept None for optional string fields
+            filtered_kwargs = {k: v for k, v in kwargs.items() if v is not None}
+
+            result = await session.call_tool(tool_name, arguments=filtered_kwargs)
             tool_result = result.content[0].text if result.content else "No result"
 
             duration_ms = int((time.time() - start_time) * 1000)
