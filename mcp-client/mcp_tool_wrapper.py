@@ -72,7 +72,7 @@ def create_mcp_tool(
     server_name: str
 ) -> StructuredTool:
     """
-    Create a LangGraph-compatible tool from an MCP tool.
+    Create a LangGraph-compatible tool from an MCP tool with server namespacing.
 
     Args:
         tool_name: Name of the MCP tool
@@ -84,6 +84,10 @@ def create_mcp_tool(
     Returns:
         StructuredTool compatible with LangGraph
     """
+
+    # Add server prefix to tool name to prevent collisions
+    # Example: "get_forecast" becomes "weather:get_forecast"
+    namespaced_tool_name = f"{server_name}:{tool_name}"
 
     async def tool_func(**kwargs) -> str:
         """Execute the MCP tool and return result."""
@@ -120,8 +124,8 @@ def create_mcp_tool(
 
     # Create LangGraph StructuredTool
     return StructuredTool(
-        name=tool_name,
-        description=tool_description or f"Call {tool_name} on {server_name} server",
+        name=namespaced_tool_name,
+        description=f"[{server_name}] {tool_description or f'Call {tool_name}'}",
         func=tool_func,
         coroutine=tool_func,  # Use async version
         args_schema=args_schema,  # Provide schema so LLM knows what parameters to use
