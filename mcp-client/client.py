@@ -16,6 +16,7 @@ from typing import Optional
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
+from mcp.client.sse import sse_client
 
 from langchain_ollama import ChatOllama
 from langchain_core.messages import HumanMessage
@@ -111,82 +112,139 @@ class MCPClient:
             self._checkpointer_cm = None
 
     async def connect_to_servers(self):
-        """Connect to all configured MCP servers."""
-        logger.info(f"Connecting to {len(self.config.servers)} MCP server(s)")
+        """Connect to all configured MCP servers (stdio and remote)."""
+        logger.info(
+            f"Connecting to {len(self.config.servers)} MCP server(s)",
+            stdio_count=sum(1 for s in self.config.servers if s.transport == "stdio"),
+            sse_count=sum(1 for s in self.config.servers if s.transport == "sse"),
+        )
 
         for server_config in self.config.servers:
-            server_name = server_config.name
-            server_path = server_config.path
-            command = server_config.command
-            args = server_config.args
-
-            correlation_id = str(uuid.uuid4())
-            log = logger.bind(
-                correlation_id=correlation_id,
-                server_name=server_name,
-                server_path=server_path,
-            )
-
-            log.info(f"Connecting to {server_name} server")
-
-            try:
-                # Build command args
-                all_args = args + [server_path]
-
-                # Determine working directory (directory containing the script)
-                # This ensures .env files are loaded correctly
-                working_dir = os.path.dirname(os.path.abspath(server_path))
-
-                server_params = StdioServerParameters(
-                    command=command,
-                    args=all_args,
-                    env=None,
-                    cwd=working_dir
-                )
-
-                # Connect to server
-                stdio_transport = await self.exit_stack.enter_async_context(
-                    stdio_client(server_params)
-                )
-                stdio, write = stdio_transport
-                session = await self.exit_stack.enter_async_context(
-                    ClientSession(stdio, write)
-                )
-
-                # Initialize the session
-                await session.initialize()
-                self.sessions[server_name] = session
-                log.info(f"Connected to {server_name} server successfully")
-
-                # List available tools from this server and convert to LangChain tools
-                response = await session.list_tools()
-                server_tools = response.tools
-
-                # Create LangChain StructuredTool for each MCP tool
-                for tool in server_tools:
-                    langchain_tool = create_mcp_tool(
-                        tool_name=tool.name,
-                        tool_description=tool.description,
-                        tool_schema=tool.inputSchema,
-                        session=session,
-                        server_name=server_name
-                    )
-                    self.langchain_tools.append(langchain_tool)
-
-                log.info(
-                    f"Loaded tools from {server_name}",
-                    tool_count=len(server_tools),
-                    tools=[tool.name for tool in server_tools],
-                )
-
-            except Exception as e:
-                log.error(f"Failed to connect to {server_name} server: {e}", exc_info=True)
-                raise
+            await self._connect_single_server(server_config)
 
         logger.info(
             "All servers connected",
             total_tools=len(self.langchain_tools),
             servers=list(self.sessions.keys()),
+        )
+
+    async def _connect_single_server(self, server_config):
+        """Connect to single MCP server based on transport type."""
+        server_name = server_config.name
+        correlation_id = str(uuid.uuid4())
+
+        log = logger.bind(
+            correlation_id=correlation_id,
+            server_name=server_name,
+            transport=server_config.transport,
+        )
+
+        log.info(f"Connecting to {server_name} server via {server_config.transport}")
+
+        try:
+            # Route to appropriate transport handler
+            if server_config.transport == "stdio":
+                await self._connect_stdio_server(server_config, log)
+            elif server_config.transport == "sse":
+                await self._connect_sse_server(server_config, log)
+            else:
+                raise ValueError(f"Unsupported transport: {server_config.transport}")
+
+            # Load tools (common for all transports)
+            await self._load_server_tools(server_name, log)
+
+        except Exception as e:
+            log.error(f"Failed to connect to {server_name} server: {e}", exc_info=True)
+            raise
+
+    async def _connect_stdio_server(self, server_config, log):
+        """Connect to stdio-based MCP server (local process)."""
+        server_name = server_config.name
+        server_path = server_config.path
+        command = server_config.command
+        args = server_config.args
+
+        all_args = args + [server_path]
+        working_dir = os.path.dirname(os.path.abspath(server_path))
+
+        server_params = StdioServerParameters(
+            command=command,
+            args=all_args,
+            env=None,
+            cwd=working_dir
+        )
+
+        stdio_transport = await self.exit_stack.enter_async_context(
+            stdio_client(server_params)
+        )
+        stdio, write = stdio_transport
+        session = await self.exit_stack.enter_async_context(
+            ClientSession(stdio, write)
+        )
+
+        await session.initialize()
+        self.sessions[server_name] = session
+        log.info(f"Connected to {server_name} server successfully (stdio)")
+
+    async def _connect_sse_server(self, server_config, log):
+        """Connect to SSE-based MCP server (remote HTTP/SSE)."""
+        server_name = server_config.name
+
+        # Substitute environment variables
+        try:
+            config_with_env = server_config.substitute_env_vars()
+        except ValueError as e:
+            log.error(f"Environment variable substitution failed: {e}")
+            raise
+
+        url = config_with_env.url
+        headers = config_with_env.headers or None
+
+        log.debug(
+            f"Connecting to SSE endpoint",
+            url=url,
+            has_headers=bool(headers),
+        )
+
+        # Connect to SSE server
+        sse_transport = await self.exit_stack.enter_async_context(
+            sse_client(
+                url=url,
+                headers=headers,
+                timeout=server_config.timeout,
+                sse_read_timeout=server_config.sse_read_timeout,
+            )
+        )
+        read_stream, write_stream = sse_transport
+        session = await self.exit_stack.enter_async_context(
+            ClientSession(read_stream, write_stream)
+        )
+
+        await session.initialize()
+        self.sessions[server_name] = session
+        log.info(f"Connected to {server_name} server successfully (SSE)", url=url)
+
+    async def _load_server_tools(self, server_name: str, log):
+        """Load tools from connected server and convert to LangChain tools."""
+        session = self.sessions[server_name]
+
+        response = await session.list_tools()
+        server_tools = response.tools
+
+        for tool in server_tools:
+            langchain_tool = create_mcp_tool(
+                tool_name=tool.name,
+                tool_description=tool.description,
+                tool_schema=tool.inputSchema,
+                session=session,
+                server_name=server_name
+            )
+            self.langchain_tools.append(langchain_tool)
+
+        log.info(
+            f"Loaded tools from {server_name}",
+            tool_count=len(server_tools),
+            tools=[tool.name for tool in server_tools],
         )
 
     async def initialize_llm(self):

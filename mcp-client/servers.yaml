@@ -1,17 +1,15 @@
 # MCP Server Configuration
-# Add as many servers as needed - each will be loaded on startup
-
 servers:
-  # Weather server - provides weather forecasts
   - name: weather
+    transport: stdio
     path: /Users/hamzilla/mcp/weather/weather.py
     command: uv
     args:
       - run
     enabled: true
 
-  # Bitbucket server - interacts with Bitbucket API
   - name: bitbucket
+    transport: stdio
     path: /Users/hamzilla/mcp/bitbucket-mcp/main.py
     command: uv
     args:

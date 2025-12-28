@@ -4,8 +4,10 @@ Configuration module for MCP Client.
 Handles environment variables and settings using Pydantic.
 """
 
-from typing import Optional
-from pydantic import BaseModel, field_validator
+from typing import Optional, Union, Literal
+import re
+import os
+from pydantic import BaseModel, field_validator, ConfigDict
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -39,14 +41,17 @@ class LLMConfig(BaseModel):
         return v
 
 
-class ServerConfig(BaseModel):
-    """MCP server configuration."""
+class StdioServerConfig(BaseModel):
+    """Stdio transport (local process execution)."""
 
+    model_config = ConfigDict(extra='forbid')
+
+    transport: Literal["stdio"] = "stdio"
     name: str
     path: str
     command: str = "uv"
     args: list[str] = ["run"]
-    enabled: bool = True  # Allow disabling servers without removing them
+    enabled: bool = True
 
     @field_validator("name")
     @classmethod
@@ -59,19 +64,96 @@ class ServerConfig(BaseModel):
     @classmethod
     def validate_path_exists(cls, v: str) -> str:
         """Validate that server path exists."""
-        import os
-
         if not v or not v.strip():
             raise ValueError("Server path cannot be empty")
 
         path = v.strip()
-        # Expand ~ and environment variables
         expanded_path = os.path.expanduser(os.path.expandvars(path))
 
         if not os.path.exists(expanded_path):
             raise ValueError(f"Server path does not exist: {expanded_path}")
 
         return path
+
+
+class SSEServerConfig(BaseModel):
+    """SSE transport (remote HTTP/SSE connection)."""
+
+    model_config = ConfigDict(extra='forbid')
+
+    transport: Literal["sse"] = "sse"
+    name: str
+    url: str  # SSE endpoint URL
+    headers: dict[str, str] = {}  # Optional headers (supports ${ENV_VAR})
+    timeout: float = 5.0  # HTTP timeout
+    sse_read_timeout: float = 300.0  # SSE read timeout (5 min)
+    enabled: bool = True
+
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, v: str) -> str:
+        if not v or not v.strip():
+            raise ValueError("Server name cannot be empty")
+        return v.strip()
+
+    @field_validator("url")
+    @classmethod
+    def validate_url_format(cls, v: str) -> str:
+        """Validate URL is well-formed."""
+        if not v or not v.strip():
+            raise ValueError("Server URL cannot be empty")
+
+        v = v.strip()
+        if not v.startswith(("http://", "https://")):
+            raise ValueError(f"URL must start with http:// or https://: {v}")
+
+        return v
+
+    def substitute_env_vars(self) -> "SSEServerConfig":
+        """
+        Substitute ${VAR_NAME} patterns with environment variables.
+
+        Raises ValueError if variable not found.
+        """
+        def substitute(value: str) -> str:
+            pattern = r'\$\{([^}]+)\}|\$([A-Za-z_][A-Za-z0-9_]*)'
+
+            def replacer(match):
+                var_name = match.group(1) or match.group(2)
+                env_value = os.getenv(var_name)
+                if env_value is None:
+                    raise ValueError(f"Environment variable not found: {var_name}")
+                return env_value
+
+            return re.sub(pattern, replacer, value)
+
+        config_dict = self.model_dump()
+        config_dict["url"] = substitute(config_dict["url"])
+        config_dict["headers"] = {k: substitute(v) for k, v in config_dict["headers"].items()}
+
+        return SSEServerConfig(**config_dict)
+
+
+# Discriminated union type
+ServerConfig = Union[StdioServerConfig, SSEServerConfig]
+
+
+def parse_server_config(data: dict) -> Union[StdioServerConfig, SSEServerConfig]:
+    """
+    Parse server config from dict using transport discriminator.
+
+    Raises ValueError if transport type unknown.
+    """
+    transport = data.get("transport")
+
+    if transport == "stdio":
+        return StdioServerConfig(**data)
+    elif transport == "sse":
+        return SSEServerConfig(**data)
+    else:
+        raise ValueError(
+            f"Unknown transport type: {transport}. Must be 'stdio' or 'sse'"
+        )
 
 
 class DatabaseConfig(BaseModel):
@@ -163,9 +245,11 @@ class MCPClientConfig(BaseSettings):
         return v
 
 
-def load_servers_from_yaml(yaml_path: str) -> list[ServerConfig]:
+def load_servers_from_yaml(yaml_path: str) -> list:
     """
-    Load server configurations from YAML file.
+    Load server configurations from YAML.
+
+    Returns list of StdioServerConfig or SSEServerConfig objects.
 
     Args:
         yaml_path: Path to servers.yaml file
@@ -194,16 +278,30 @@ def load_servers_from_yaml(yaml_path: str) -> list[ServerConfig]:
 
     servers = []
     for server_dict in data['servers']:
-        server = ServerConfig(**server_dict)
+        # Validate transport field present
+        if 'transport' not in server_dict:
+            raise ValueError(
+                f"Server '{server_dict.get('name', 'unknown')}' missing required 'transport' field. "
+                f"Must be 'stdio' or 'sse'"
+            )
+
+        # Parse based on transport type
+        server = parse_server_config(server_dict)
 
         # Only include enabled servers
         if server.enabled:
             servers.append(server)
+            logger.info(f"Loaded {server.transport} server: {server.name}")
         else:
             logger.info(f"Skipping disabled server: {server.name}")
 
     if not servers:
         raise ValueError("No enabled servers found in servers.yaml")
 
-    logger.info(f"Loaded {len(servers)} enabled servers from {yaml_path}")
+    logger.info(
+        f"Loaded {len(servers)} enabled servers from {yaml_path}",
+        stdio_count=sum(1 for s in servers if isinstance(s, StdioServerConfig)),
+        sse_count=sum(1 for s in servers if isinstance(s, SSEServerConfig)),
+    )
+
     return servers

@@ -1,46 +1,68 @@
-# MCP Server Configuration Example
-# Copy this file to servers.yaml and customize for your environment
+# MCP Server Configuration
+# Supports mixed stdio (local) and SSE (remote) servers
 
 servers:
-  # Weather Server
-  # Provides weather forecast capabilities
-  - name: weather
+  # ============================================================================
+  # STDIO SERVERS (Local Development)
+  # ============================================================================
+
+  - transport: stdio
+    name: weather
     path: /Users/hamzilla/mcp/weather/weather.py
     command: uv
     args:
       - run
     enabled: true
 
-  # Bitbucket Server
-  # Integrates with Bitbucket Cloud API
-  - name: bitbucket
+  - transport: stdio
+    name: bitbucket
     path: /Users/hamzilla/mcp/bitbucket-mcp/main.py
     command: uv
     args:
       - run
     enabled: true
 
-  # Grafana Server (Example - Disabled)
-  # Uncomment and configure to enable
-  # - name: grafana
-  #   path: ~/mcp-servers/grafana-mcp
-  #   command: python
-  #   args:
-  #     - -m
-  #     - grafana_mcp
-  #   enabled: false
+  # ============================================================================
+  # SSE SERVERS (Remote/Kubernetes Deployment)
+  # ============================================================================
 
-  # Kubernetes Server (Example - Disabled)
-  # - name: kubernetes
-  #   path: /opt/mcp/kubernetes-server
-  #   command: node
-  #   args:
-  #     - index.js
-  #   enabled: false
+  # Weather Server - Remote SSE (Production)
+  - transport: sse
+    name: weather-remote
+    url: ${WEATHER_SERVICE_URL}  # e.g., https://weather-mcp.prod.svc.cluster.local/sse
+    headers:
+      Authorization: "Bearer ${WEATHER_AUTH_TOKEN}"
+    timeout: 5.0
+    sse_read_timeout: 300.0
+    enabled: false  # Enable in production
 
-# Notes:
-# - Server names must be unique
-# - Paths support ~ expansion and environment variables
-# - Tools will be namespaced as "server_name:tool_name"
-# - Set enabled: false to disable a server without removing it
-# - To apply changes, restart the client
+  # Kubernetes MCP Server
+  - transport: sse
+    name: kubernetes
+    url: ${K8S_MCP_URL}
+    headers:
+      Authorization: "Bearer ${K8S_SERVICE_TOKEN}"
+    timeout: 10.0
+    sse_read_timeout: 600.0
+    enabled: false
+
+# ============================================================================
+# Notes
+# ============================================================================
+#
+# TRANSPORT TYPES:
+#   - stdio: Local process execution (development)
+#   - sse: Remote HTTP/SSE connection (production/K8s)
+#
+# ENVIRONMENT VARIABLES:
+#   - Use ${VAR_NAME} in url and headers
+#   - Variables must be set in .env or K8s secrets
+#   - Missing variables will cause startup failure
+#
+# TOOL NAMESPACING:
+#   - Tools are namespaced as "server_name:tool_name"
+#   - Example: "weather:get_forecast"
+#
+# TIMEOUTS:
+#   - timeout: HTTP timeout (default: 5s)
+#   - sse_read_timeout: SSE event timeout (default: 300s)
