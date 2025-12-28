@@ -411,26 +411,23 @@ async def main():
     from dotenv import load_dotenv
     load_dotenv()
 
-    # Example of configuring servers programmatically
-    # Note: In production, you might want to load these from a config file
-    from config import ServerConfig
+    from config import load_servers_from_yaml
+    import os
 
-    servers = [
-        ServerConfig(
-            name="weather",
-            path="/Users/hamzilla/mcp/weather/weather.py",
-            command="uv",
-            args=["run"]
-        ),
-        ServerConfig(
-            name="bitbucket",
-            path="/Users/hamzilla/mcp/bitbucket-mcp/main.py",
-            command="uv",
-            args=["run"]
-        )
-    ]
+    # Load servers from YAML configuration
+    servers_yaml_path = os.getenv("SERVERS_CONFIG", "servers.yaml")
 
-    # Create configuration
+    try:
+        servers = load_servers_from_yaml(servers_yaml_path)
+    except FileNotFoundError:
+        logger.error(f"Server configuration file not found: {servers_yaml_path}")
+        logger.info("Please create a servers.yaml file. See servers.yaml.example for reference.")
+        return
+    except Exception as e:
+        logger.error(f"Failed to load server configuration: {e}")
+        return
+
+    # Create configuration with loaded servers
     config = MCPClientConfig(servers=servers)
 
     # Create and run client

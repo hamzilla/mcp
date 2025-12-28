@@ -1,0 +1,46 @@
+# MCP Server Configuration Example
+# Copy this file to servers.yaml and customize for your environment
+
+servers:
+  # Weather Server
+  # Provides weather forecast capabilities
+  - name: weather
+    path: /Users/hamzilla/mcp/weather/weather.py
+    command: uv
+    args:
+      - run
+    enabled: true
+
+  # Bitbucket Server
+  # Integrates with Bitbucket Cloud API
+  - name: bitbucket
+    path: /Users/hamzilla/mcp/bitbucket-mcp/main.py
+    command: uv
+    args:
+      - run
+    enabled: true
+
+  # Grafana Server (Example - Disabled)
+  # Uncomment and configure to enable
+  # - name: grafana
+  #   path: ~/mcp-servers/grafana-mcp
+  #   command: python
+  #   args:
+  #     - -m
+  #     - grafana_mcp
+  #   enabled: false
+
+  # Kubernetes Server (Example - Disabled)
+  # - name: kubernetes
+  #   path: /opt/mcp/kubernetes-server
+  #   command: node
+  #   args:
+  #     - index.js
+  #   enabled: false
+
+# Notes:
+# - Server names must be unique
+# - Paths support ~ expansion and environment variables
+# - Tools will be namespaced as "server_name:tool_name"
+# - Set enabled: false to disable a server without removing it
+# - To apply changes, restart the client

@@ -46,6 +46,7 @@ class ServerConfig(BaseModel):
     path: str
     command: str = "uv"
     args: list[str] = ["run"]
+    enabled: bool = True  # Allow disabling servers without removing them
 
     @field_validator("name")
     @classmethod
@@ -56,10 +57,21 @@ class ServerConfig(BaseModel):
 
     @field_validator("path")
     @classmethod
-    def validate_path(cls, v: str) -> str:
+    def validate_path_exists(cls, v: str) -> str:
+        """Validate that server path exists."""
+        import os
+
         if not v or not v.strip():
             raise ValueError("Server path cannot be empty")
-        return v.strip()
+
+        path = v.strip()
+        # Expand ~ and environment variables
+        expanded_path = os.path.expanduser(os.path.expandvars(path))
+
+        if not os.path.exists(expanded_path):
+            raise ValueError(f"Server path does not exist: {expanded_path}")
+
+        return path
 
 
 class DatabaseConfig(BaseModel):
@@ -149,3 +161,49 @@ class MCPClientConfig(BaseSettings):
         if not 1 <= v <= 65535:
             raise ValueError("metrics_port must be between 1 and 65535")
         return v
+
+
+def load_servers_from_yaml(yaml_path: str) -> list[ServerConfig]:
+    """
+    Load server configurations from YAML file.
+
+    Args:
+        yaml_path: Path to servers.yaml file
+
+    Returns:
+        List of ServerConfig objects (only enabled servers)
+
+    Raises:
+        FileNotFoundError: If YAML file doesn't exist
+        ValueError: If YAML is invalid or server validation fails
+    """
+    import yaml
+    from pathlib import Path
+    from loguru import logger
+
+    path = Path(yaml_path)
+
+    if not path.exists():
+        raise FileNotFoundError(f"Server configuration file not found: {yaml_path}")
+
+    with open(path, 'r') as f:
+        data = yaml.safe_load(f)
+
+    if not data or 'servers' not in data:
+        raise ValueError(f"Invalid servers.yaml: missing 'servers' key")
+
+    servers = []
+    for server_dict in data['servers']:
+        server = ServerConfig(**server_dict)
+
+        # Only include enabled servers
+        if server.enabled:
+            servers.append(server)
+        else:
+            logger.info(f"Skipping disabled server: {server.name}")
+
+    if not servers:
+        raise ValueError("No enabled servers found in servers.yaml")
+
+    logger.info(f"Loaded {len(servers)} enabled servers from {yaml_path}")
+    return servers
