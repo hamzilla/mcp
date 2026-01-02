@@ -34,6 +34,9 @@ servers:
       Authorization: "Bearer ${WEATHER_AUTH_TOKEN}"
     timeout: 5.0
     sse_read_timeout: 300.0
+    max_retries: 3  # Number of connection retry attempts (default: 3)
+    retry_delay: 1.0  # Initial retry delay in seconds (default: 1.0)
+    retry_backoff_factor: 2.0  # Exponential backoff multiplier (default: 2.0)
     enabled: false  # Enable in production
 
   # Kubernetes MCP Server
@@ -44,6 +47,9 @@ servers:
       Authorization: "Bearer ${K8S_SERVICE_TOKEN}"
     timeout: 10.0
     sse_read_timeout: 600.0
+    max_retries: 5  # Higher retry count for K8s (may have temporary network issues)
+    retry_delay: 2.0
+    retry_backoff_factor: 2.0
     enabled: false
 
 # ============================================================================
@@ -66,3 +72,9 @@ servers:
 # TIMEOUTS:
 #   - timeout: HTTP timeout (default: 5s)
 #   - sse_read_timeout: SSE event timeout (default: 300s)
+#
+# RETRY CONFIGURATION (SSE only):
+#   - max_retries: Maximum connection retry attempts (default: 3)
+#   - retry_delay: Initial retry delay in seconds (default: 1.0)
+#   - retry_backoff_factor: Exponential backoff multiplier (default: 2.0)
+#   - Example: With defaults, retries happen at 1s, 2s, 4s delays

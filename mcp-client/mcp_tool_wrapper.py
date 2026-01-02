@@ -69,7 +69,8 @@ def create_mcp_tool(
     tool_description: str,
     tool_schema: dict,
     session: ClientSession,
-    server_name: str
+    server_name: str,
+    get_session_callback: Optional[Callable[[str], ClientSession]] = None,
 ) -> StructuredTool:
     """
     Create a LangGraph-compatible tool from an MCP tool with server namespacing.
@@ -80,6 +81,7 @@ def create_mcp_tool(
         tool_schema: JSON schema for tool input
         session: MCP client session for the server that has this tool
         server_name: Name of the MCP server
+        get_session_callback: Optional callback to get fresh session (for reconnection)
 
     Returns:
         StructuredTool compatible with LangGraph
@@ -105,16 +107,43 @@ def create_mcp_tool(
             # MCP servers validate against JSON schema which doesn't accept None for optional string fields
             filtered_kwargs = {k: v for k, v in kwargs.items() if v is not None}
 
-            result = await session.call_tool(tool_name, arguments=filtered_kwargs)
+            # Get current session (may be refreshed after reconnection)
+            current_session = get_session_callback(server_name) if get_session_callback else session
+
+            result = await current_session.call_tool(tool_name, arguments=filtered_kwargs)
             tool_result = result.content[0].text if result.content else "No result"
 
             duration_ms = int((time.time() - start_time) * 1000)
-            tool_log.info(f"MCP tool call to {tool_name} completed successfully in {duration_ms}ms")
+            tool_log.info(f"MCP tool call to {namespaced_tool_name} completed successfully in {duration_ms}ms")
             return tool_result
         except Exception as e:
             duration_ms = int((time.time() - start_time) * 1000)
+            error_type = type(e).__name__
+
+            # Check if this is an SSE timeout/connection error
+            is_sse_error = any(err in error_type.lower() for err in ['timeout', 'read', 'connection'])
+
+            if is_sse_error and get_session_callback:
+                tool_log.warning(
+                    f"SSE connection error detected in tool call, error will be returned to agent",
+                    error=str(e),
+                    error_type=error_type,
+                )
+
             tool_log.error(f"Error calling MCP tool after {duration_ms}ms: {e}", exc_info=True)
-            return f"Error: {str(e)}"
+
+            # Provide more detailed error message for the agent
+            error_msg = str(e)
+            if not error_msg or error_msg == error_type or error_type == "KeyError":
+                # For KeyError and other unclear errors, provide more context
+                import traceback
+                tb_str = ''.join(traceback.format_exception(type(e), e, e.__traceback__))
+                # Extract the most relevant line from traceback
+                if "KeyError" in error_type:
+                    return f"Error: Missing required field {error_msg} in response from {server_name} server. This may be a bug in the MCP server implementation."
+                return f"Error ({error_type}): {error_msg}\n\nTraceback:\n{tb_str}"
+
+            return f"Error ({error_type}): {error_msg}"
 
     # Convert MCP JSON schema to Pydantic model
     args_schema = json_schema_to_pydantic(

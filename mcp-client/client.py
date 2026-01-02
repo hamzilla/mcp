@@ -17,6 +17,7 @@ from typing import Optional
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from mcp.client.sse import sse_client
+import httpx
 
 from langchain_ollama import ChatOllama
 from langchain_core.messages import HumanMessage
@@ -49,6 +50,7 @@ class MCPClient:
 
         # Client state
         self.sessions: dict[str, ClientSession] = {}
+        self.server_configs: dict[str, ServerConfig] = {}  # Map server names to their configs
         self.exit_stack = AsyncExitStack()
         self.llm = None
         self.langchain_tools = []  # LangChain StructuredTool objects
@@ -142,6 +144,9 @@ class MCPClient:
         log.info(f"Connecting to {server_name} server via {server_config.transport}")
 
         try:
+            # Store server config for potential reconnection
+            self.server_configs[server_name] = server_config
+
             # Route to appropriate transport handler
             if server_config.transport == "stdio":
                 await self._connect_stdio_server(server_config, log)
@@ -187,7 +192,7 @@ class MCPClient:
         log.info(f"Connected to {server_name} server successfully (stdio)")
 
     async def _connect_sse_server(self, server_config, log):
-        """Connect to SSE-based MCP server (remote HTTP/SSE)."""
+        """Connect to SSE-based MCP server (remote HTTP/SSE) with retry logic."""
         server_name = server_config.name
 
         # Substitute environment variables
@@ -204,25 +209,76 @@ class MCPClient:
             f"Connecting to SSE endpoint",
             url=url,
             has_headers=bool(headers),
+            max_retries=server_config.max_retries,
         )
 
-        # Connect to SSE server
-        sse_transport = await self.exit_stack.enter_async_context(
-            sse_client(
-                url=url,
-                headers=headers,
-                timeout=server_config.timeout,
-                sse_read_timeout=server_config.sse_read_timeout,
-            )
-        )
-        read_stream, write_stream = sse_transport
-        session = await self.exit_stack.enter_async_context(
-            ClientSession(read_stream, write_stream)
-        )
+        # Retry loop with exponential backoff
+        last_exception = None
+        for attempt in range(server_config.max_retries + 1):
+            try:
+                if attempt > 0:
+                    # Calculate exponential backoff delay
+                    delay = server_config.retry_delay * (server_config.retry_backoff_factor ** (attempt - 1))
+                    log.warning(
+                        f"Retrying SSE connection to {server_name}",
+                        attempt=attempt,
+                        max_retries=server_config.max_retries,
+                        delay_seconds=delay,
+                    )
+                    await asyncio.sleep(delay)
 
-        await session.initialize()
-        self.sessions[server_name] = session
-        log.info(f"Connected to {server_name} server successfully (SSE)", url=url)
+                # Create httpx client factory that accepts self-signed certificates
+                def custom_httpx_client_factory(**kwargs):
+                    """Create httpx client with SSL verification disabled for self-signed certs."""
+                    return httpx.AsyncClient(verify=False, **kwargs)
+
+                # Connect to SSE server
+                sse_transport = await self.exit_stack.enter_async_context(
+                    sse_client(
+                        url=url,
+                        headers=headers,
+                        timeout=server_config.timeout,
+                        sse_read_timeout=server_config.sse_read_timeout,
+                        httpx_client_factory=custom_httpx_client_factory,
+                    )
+                )
+                read_stream, write_stream = sse_transport
+                session = await self.exit_stack.enter_async_context(
+                    ClientSession(read_stream, write_stream)
+                )
+
+                await session.initialize()
+                self.sessions[server_name] = session
+
+                if attempt > 0:
+                    log.info(
+                        f"Connected to {server_name} server successfully (SSE) after {attempt} retries",
+                        url=url,
+                        attempts=attempt + 1,
+                    )
+                else:
+                    log.info(f"Connected to {server_name} server successfully (SSE)", url=url)
+
+                return  # Success, exit retry loop
+
+            except Exception as e:
+                last_exception = e
+                log.warning(
+                    f"SSE connection attempt {attempt + 1}/{server_config.max_retries + 1} failed",
+                    error=str(e),
+                    error_type=type(e).__name__,
+                )
+
+                # If this was the last attempt, raise
+                if attempt >= server_config.max_retries:
+                    break
+
+        # All retries exhausted
+        log.error(
+            f"Failed to connect to {server_name} after {server_config.max_retries + 1} attempts",
+            final_error=str(last_exception),
+        )
+        raise last_exception
 
     async def _load_server_tools(self, server_name: str, log):
         """Load tools from connected server and convert to LangChain tools."""
@@ -237,7 +293,8 @@ class MCPClient:
                 tool_description=tool.description,
                 tool_schema=tool.inputSchema,
                 session=session,
-                server_name=server_name
+                server_name=server_name,
+                get_session_callback=lambda name: self.sessions[name],
             )
             self.langchain_tools.append(langchain_tool)
 
@@ -246,6 +303,56 @@ class MCPClient:
             tool_count=len(server_tools),
             tools=[tool.name for tool in server_tools],
         )
+
+    async def _verify_ollama_connection(self, log):
+        """Verify that Ollama is reachable at the configured URL."""
+        import httpx
+
+        log.info(f"Verifying Ollama connection at {self.config.ollama_base_url}")
+
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                # Try to reach Ollama's API endpoint
+                response = await client.get(f"{self.config.ollama_base_url}/api/tags")
+
+                if response.status_code == 200:
+                    data = response.json()
+                    models = data.get("models", [])
+                    model_names = [m.get("name") for m in models]
+
+                    log.info(f"✅ Ollama is reachable", available_models=len(models))
+
+                    # Check if the configured model exists
+                    if self.config.llm.model_name not in model_names:
+                        log.warning(
+                            f"⚠️  Model '{self.config.llm.model_name}' not found in Ollama",
+                            available_models=model_names,
+                        )
+                        log.warning(f"   Run: ollama pull {self.config.llm.model_name}")
+                    else:
+                        log.info(f"✅ Model '{self.config.llm.model_name}' is available")
+
+                else:
+                    log.error(f"❌ Ollama returned status {response.status_code}")
+                    raise ConnectionError(f"Ollama returned status {response.status_code}")
+
+        except httpx.ConnectError as e:
+            log.error(f"❌ Cannot connect to Ollama at {self.config.ollama_base_url}")
+            log.error(f"   Error: {e}")
+            log.error(f"   Make sure Ollama is running:")
+            log.error(f"   1. Check if Ollama is installed: ollama --version")
+            log.error(f"   2. Start Ollama: ollama serve")
+            log.error(f"   3. Or check OLLAMA_BASE_URL in .env")
+            raise ConnectionError(f"Cannot connect to Ollama at {self.config.ollama_base_url}") from e
+
+        except httpx.TimeoutException as e:
+            log.error(f"❌ Timeout connecting to Ollama at {self.config.ollama_base_url}")
+            log.error(f"   Ollama may be overloaded or unresponsive")
+            raise ConnectionError(f"Timeout connecting to Ollama") from e
+
+        except Exception as e:
+            log.error(f"❌ Unexpected error verifying Ollama connection: {e}")
+            raise
 
     async def initialize_llm(self):
         """Initialize Ollama LLM and create LangGraph agent."""
@@ -256,6 +363,9 @@ class MCPClient:
         )
 
         log.info(f"Initializing Ollama LLM with model {self.config.llm.model_name}")
+
+        # Verify Ollama is reachable before initializing
+        await self._verify_ollama_connection(log)
 
         # Initialize ChatOllama
         self.llm = ChatOllama(

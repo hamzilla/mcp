@@ -15,3 +15,17 @@ servers:
     args:
       - run
     enabled: true
+
+  - name: grafana
+    transport: sse
+    url: https://localhost:8443/sse
+    timeout: 5.0
+    sse_read_timeout: 600.0  # 10 minutes - increased for slow Grafana queries
+    enabled: false
+
+  - name: victoriametrics
+    transport: sse
+    url: http://localhost:8080 # https://localhost:8444/sse
+    timeout: 5.0
+    sse_read_timeout: 600.0  # 10 minutes - for long-running queries
+    enabled: true

@@ -89,6 +89,11 @@ class SSEServerConfig(BaseModel):
     sse_read_timeout: float = 300.0  # SSE read timeout (5 min)
     enabled: bool = True
 
+    # Retry configuration
+    max_retries: int = 3  # Maximum number of connection retry attempts
+    retry_delay: float = 1.0  # Initial retry delay in seconds (exponential backoff)
+    retry_backoff_factor: float = 2.0  # Multiply delay by this factor after each retry
+
     @field_validator("name")
     @classmethod
     def validate_name(cls, v: str) -> str:
